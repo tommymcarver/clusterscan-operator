@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- scan_v1alpha1_clusterscan.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

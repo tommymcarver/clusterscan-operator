@@ -1,0 +1,44 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - scan.spectrocloud.com
+  resources:
+  - clusterscans
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - scan.spectrocloud.com
+  resources:
+  - clusterscans/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - scan.spectrocloud.com
+  resources:
+  - clusterscans/status
+  verbs:
+  - get
+  - patch
+  - update
