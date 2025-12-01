@@ -34,6 +34,8 @@ import (
 	scanv1alpha1 "github.com/tommymcarver/clusterscan-operator/api/v1alpha1"
 )
 
+const fiveMinuteCronSchedule = "*/5 * * * *"
+
 // parseQuantity is a helper to parse resource quantities in tests
 func parseQuantity(s string) *resource.Quantity {
 	q := resource.MustParse(s)
@@ -437,14 +439,14 @@ var _ = Describe("ClusterScan Controller", func() {
 		Context("Scheduled scans", func() {
 			It("should return Pending for scheduled scan with no jobs", func() {
 				scan := newTestClusterScan("test", "default")
-				scan.Spec.Schedule = "*/5 * * * *"
+				scan.Spec.Schedule = fiveMinuteCronSchedule
 				phase := reconciler.determinePhase(scan, nil, nil, nil)
 				Expect(phase).To(Equal(scanv1alpha1.ScanPhasePending))
 			})
 
 			It("should return Running when active jobs exist", func() {
 				scan := newTestClusterScan("test", "default")
-				scan.Spec.Schedule = "*/5 * * * *"
+				scan.Spec.Schedule = fiveMinuteCronSchedule
 				activeJob := &batchv1.Job{Status: batchv1.JobStatus{Active: 1}}
 				phase := reconciler.determinePhase(scan, []*batchv1.Job{activeJob}, nil, nil)
 				Expect(phase).To(Equal(scanv1alpha1.ScanPhaseRunning))
@@ -452,7 +454,7 @@ var _ = Describe("ClusterScan Controller", func() {
 
 			It("should return Completed when last job succeeded", func() {
 				scan := newTestClusterScan("test", "default")
-				scan.Spec.Schedule = "*/5 * * * *"
+				scan.Spec.Schedule = fiveMinuteCronSchedule
 				now := time.Now()
 				successfulJob := &batchv1.Job{
 					Status: batchv1.JobStatus{
@@ -467,7 +469,7 @@ var _ = Describe("ClusterScan Controller", func() {
 
 			It("should return Failed when last job failed", func() {
 				scan := newTestClusterScan("test", "default")
-				scan.Spec.Schedule = "*/5 * * * *"
+				scan.Spec.Schedule = fiveMinuteCronSchedule
 				now := time.Now()
 				failedJob := &batchv1.Job{
 					Status: batchv1.JobStatus{
@@ -573,7 +575,7 @@ var _ = Describe("ClusterScan Controller", func() {
 
 		It("should return TriggerReasonSchedule when schedule time reached", func() {
 			scan := newTestClusterScan("test", "default")
-			scan.Spec.Schedule = "*/5 * * * *" // Every 5 minutes
+			scan.Spec.Schedule = fiveMinuteCronSchedule // Every 5 minutes
 			// Clock is set to 00:05:00, which is a 5-minute boundary
 
 			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
@@ -587,7 +589,7 @@ var _ = Describe("ClusterScan Controller", func() {
 			clock.currentTime = now
 
 			scan := newTestClusterScan("test", "default")
-			scan.Spec.Schedule = "*/5 * * * *" // Every 5 minutes
+			scan.Spec.Schedule = fiveMinuteCronSchedule // Every 5 minutes
 			scan.Status.LastScheduleTime = &metav1.Time{Time: lastSchedule}
 
 			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
@@ -906,7 +908,7 @@ var _ = Describe("ClusterScan Controller", func() {
 
 		It("should return next time for valid cron schedule", func() {
 			scan := newTestClusterScan("test", "default")
-			scan.Spec.Schedule = "*/5 * * * *" // Every 5 minutes
+			scan.Spec.Schedule = fiveMinuteCronSchedule // Every 5 minutes
 
 			nextTime, err := reconciler.getNextScheduleTime(scan)
 
@@ -965,7 +967,7 @@ var _ = Describe("ClusterScan Controller", func() {
 
 		It("should return true when schedule time is reached", func() {
 			scan := newTestClusterScan("test", "default")
-			scan.Spec.Schedule = "*/5 * * * *"
+			scan.Spec.Schedule = fiveMinuteCronSchedule
 			// Created at 00:00, clock at 00:05
 
 			reached, _ := reconciler.isScheduledTimeReached(context.Background(), scan)
@@ -974,7 +976,7 @@ var _ = Describe("ClusterScan Controller", func() {
 
 		It("should handle starting deadline seconds", func() {
 			scan := newTestClusterScan("test", "default")
-			scan.Spec.Schedule = "*/5 * * * *"
+			scan.Spec.Schedule = fiveMinuteCronSchedule
 			scan.Spec.StartingDeadlineSeconds = ptr.To(int64(60)) // 1 minute deadline
 
 			// This test verifies the deadline logic path is executed
@@ -1238,7 +1240,7 @@ var _ = Describe("ClusterScan Controller", func() {
 		Describe("ClusterScan validation", func() {
 			It("should accept valid cron schedule", func() {
 				scan := newTestClusterScan("valid-schedule", testNs)
-				scan.Spec.Schedule = "*/5 * * * *"
+				scan.Spec.Schedule = fiveMinuteCronSchedule
 				Expect(k8sClient.Create(ctx, scan)).To(Succeed())
 			})
 

@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -35,6 +36,9 @@ import (
 
 // namespace where the project is deployed in
 const namespace = "clusterscan-operator-system"
+
+// testNamespace where test resources are created
+const testNamespace = "default"
 
 // serviceAccountName created for the project
 const serviceAccountName = "clusterscan-operator-controller-manager"
@@ -267,16 +271,407 @@ var _ = Describe("Manager", Ordered, func() {
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
+	})
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+	// ============================================================
+	// ClusterScan E2E Tests
+	// ============================================================
+
+	Context("ClusterScan", func() {
+		// Helper function to create ClusterScan YAML
+		createClusterScanYAML := func(name string, spec string) string {
+			return fmt.Sprintf(`
+apiVersion: scan.spectrocloud.com/v1alpha1
+kind: ClusterScan
+metadata:
+  name: %s
+  namespace: %s
+spec:
+%s`, name, testNamespace, spec)
+		}
+
+		// Helper to apply YAML
+		applyYAML := func(yaml string) error {
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(yaml)
+			_, err := utils.Run(cmd)
+			return err
+		}
+
+		// Helper to delete ClusterScan
+		deleteClusterScan := func(name string) {
+			cmd := exec.Command("kubectl", "delete", "clusterscan", name, "-n", testNamespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		}
+
+		// Helper to get ClusterScan status
+		getClusterScanStatus := func(name string, jsonPath string) (string, error) {
+			cmd := exec.Command("kubectl", "get", "clusterscan", name, "-n", testNamespace, "-o", fmt.Sprintf("jsonpath=%s", jsonPath))
+			return utils.Run(cmd)
+		}
+
+		// Helper to count jobs for a ClusterScan
+		countJobsForScan := func(name string) (int, error) {
+			cmd := exec.Command("kubectl", "get", "jobs", "-l", fmt.Sprintf("scan.spectrocloud.com/clusterscan=%s", name), "-n", testNamespace, "-o", "name")
+			output, err := utils.Run(cmd)
+			if err != nil {
+				return 0, err
+			}
+			if output == "" {
+				return 0, nil
+			}
+			return len(utils.GetNonEmptyLines(output)), nil
+		}
+
+		AfterEach(func() {
+			// Clean up test ClusterScans
+			for _, name := range []string{
+				"e2e-oneoff-scan",
+				"e2e-scheduled-scan",
+				"e2e-triggernow-scan",
+				"e2e-annotation-scan",
+				"e2e-suspend-scan",
+				"e2e-finalizer-scan",
+				"e2e-history-scan",
+			} {
+				deleteClusterScan(name)
+			}
+
+			// Wait for jobs to be cleaned up
+			time.Sleep(2 * time.Second)
+		})
+
+		Describe("One-off Scan", func() {
+			It("should create a Job immediately for a one-off scan", func() {
+				scanName := "e2e-oneoff-scan"
+				yaml := createClusterScanYAML(scanName, `
+  scanTemplate:
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'E2E one-off scan completed'; exit 0"]
+    activeDeadlineSeconds: 60
+    backoffLimit: 1`)
+
+				By("creating the ClusterScan")
+				err := applyYAML(yaml)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("verifying a Job is created")
+				verifyJobCreated := func(g Gomega) {
+					count, err := countJobsForScan(scanName)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(count).To(BeNumerically(">=", 1), "Expected at least 1 job")
+				}
+				Eventually(verifyJobCreated, 30*time.Second).Should(Succeed())
+
+				By("verifying the scan status is updated")
+				verifyStatus := func(g Gomega) {
+					phase, err := getClusterScanStatus(scanName, "{.status.phase}")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(phase).To(BeElementOf("Running", "Completed", "Pending"))
+				}
+				Eventually(verifyStatus, 30*time.Second).Should(Succeed())
+			})
+
+			It("should not create additional jobs for one-off scan after completion", func() {
+				scanName := "e2e-oneoff-scan"
+				yaml := createClusterScanYAML(scanName, `
+  scanTemplate:
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'Quick scan'; exit 0"]
+    activeDeadlineSeconds: 30
+    backoffLimit: 1`)
+
+				By("creating the ClusterScan")
+				err := applyYAML(yaml)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for job to complete")
+				verifyJobCompleted := func(g Gomega) {
+					phase, err := getClusterScanStatus(scanName, "{.status.phase}")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(phase).To(Equal("Completed"))
+				}
+				Eventually(verifyJobCompleted, 60*time.Second).Should(Succeed())
+
+				By("recording initial job count")
+				initialCount, err := countJobsForScan(scanName)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting and verifying no new jobs are created")
+				time.Sleep(5 * time.Second)
+				finalCount, err := countJobsForScan(scanName)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(finalCount).To(Equal(initialCount), "No new jobs should be created")
+			})
+		})
+
+		Describe("TriggerNow", func() {
+			It("should create a Job when triggerNow is set", func() {
+				scanName := "e2e-triggernow-scan"
+
+				By("creating a ClusterScan without triggerNow (already ran)")
+				yaml := createClusterScanYAML(scanName, `
+  scanTemplate:
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'Initial scan'; exit 0"]
+    activeDeadlineSeconds: 30
+    backoffLimit: 1`)
+				err := applyYAML(yaml)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for first job to complete")
+				verifyFirstJobComplete := func(g Gomega) {
+					phase, err := getClusterScanStatus(scanName, "{.status.phase}")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(phase).To(Equal("Completed"))
+				}
+				Eventually(verifyFirstJobComplete, 60*time.Second).Should(Succeed())
+
+				By("recording job count")
+				initialCount, err := countJobsForScan(scanName)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("setting triggerNow to true")
+				cmd := exec.Command("kubectl", "patch", "clusterscan", scanName, "-n", testNamespace,
+					"--type=merge", "-p", `{"spec":{"triggerNow":true}}`)
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("verifying a new Job is created")
+				verifyNewJob := func(g Gomega) {
+					count, err := countJobsForScan(scanName)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(count).To(BeNumerically(">", initialCount), "Expected new job to be created")
+				}
+				Eventually(verifyNewJob, 30*time.Second).Should(Succeed())
+
+				By("verifying triggerNow is reset to false")
+				verifyTriggerReset := func(g Gomega) {
+					triggerNow, err := getClusterScanStatus(scanName, "{.spec.triggerNow}")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(triggerNow).To(BeElementOf("false", ""))
+				}
+				Eventually(verifyTriggerReset, 30*time.Second).Should(Succeed())
+			})
+		})
+
+		Describe("Trigger Annotation", func() {
+			It("should create a Job when trigger annotation is set", func() {
+				scanName := "e2e-annotation-scan"
+
+				By("creating a ClusterScan")
+				yaml := createClusterScanYAML(scanName, `
+  scanTemplate:
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'Annotation scan'; exit 0"]
+    activeDeadlineSeconds: 30
+    backoffLimit: 1`)
+				err := applyYAML(yaml)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for first job to complete")
+				verifyFirstJobComplete := func(g Gomega) {
+					phase, err := getClusterScanStatus(scanName, "{.status.phase}")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(phase).To(Equal("Completed"))
+				}
+				Eventually(verifyFirstJobComplete, 60*time.Second).Should(Succeed())
+
+				By("recording job count")
+				initialCount, err := countJobsForScan(scanName)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("adding trigger annotation")
+				timestamp := fmt.Sprintf("%d", time.Now().Unix())
+				cmd := exec.Command("kubectl", "annotate", "clusterscan", scanName, "-n", testNamespace,
+					fmt.Sprintf("scan.spectrocloud.com/trigger=%s", timestamp), "--overwrite")
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("verifying a new Job is created")
+				verifyNewJob := func(g Gomega) {
+					count, err := countJobsForScan(scanName)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(count).To(BeNumerically(">", initialCount), "Expected new job to be created")
+				}
+				Eventually(verifyNewJob, 30*time.Second).Should(Succeed())
+			})
+		})
+
+		Describe("Suspend", func() {
+			It("should not create Jobs when suspended", func() {
+				scanName := "e2e-suspend-scan"
+
+				By("creating a suspended ClusterScan")
+				yaml := createClusterScanYAML(scanName, `
+  suspend: true
+  triggerNow: true
+  scanTemplate:
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'Should not run'; exit 0"]
+    activeDeadlineSeconds: 30
+    backoffLimit: 1`)
+				err := applyYAML(yaml)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting to ensure no jobs are created")
+				time.Sleep(10 * time.Second)
+
+				By("verifying no jobs exist")
+				count, err := countJobsForScan(scanName)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(count).To(Equal(0), "No jobs should be created when suspended")
+			})
+		})
+
+		Describe("Finalizer and Cleanup", func() {
+			It("should clean up Jobs when ClusterScan is deleted", func() {
+				scanName := "e2e-finalizer-scan"
+
+				By("creating a ClusterScan")
+				yaml := createClusterScanYAML(scanName, `
+  scanTemplate:
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'Finalizer test scan'; sleep 30; exit 0"]
+    activeDeadlineSeconds: 120
+    backoffLimit: 1`)
+				err := applyYAML(yaml)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("verifying finalizer is added")
+				verifyFinalizer := func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "clusterscan", scanName, "-n", testNamespace,
+						"-o", "jsonpath={.metadata.finalizers}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(ContainSubstring("scan.spectrocloud.com/finalizer"))
+				}
+				Eventually(verifyFinalizer, 30*time.Second).Should(Succeed())
+
+				By("waiting for job to start")
+				verifyJobStarted := func(g Gomega) {
+					count, err := countJobsForScan(scanName)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(count).To(BeNumerically(">=", 1))
+				}
+				Eventually(verifyJobStarted, 30*time.Second).Should(Succeed())
+
+				By("deleting the ClusterScan")
+				cmd := exec.Command("kubectl", "delete", "clusterscan", scanName, "-n", testNamespace)
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("verifying ClusterScan is deleted")
+				verifyScanDeleted := func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "clusterscan", scanName, "-n", testNamespace)
+					_, err := utils.Run(cmd)
+					g.Expect(err).To(HaveOccurred(), "ClusterScan should be deleted")
+				}
+				Eventually(verifyScanDeleted, 60*time.Second).Should(Succeed())
+
+				By("verifying Jobs are cleaned up")
+				verifyJobsDeleted := func(g Gomega) {
+					count, err := countJobsForScan(scanName)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(count).To(Equal(0), "Jobs should be cleaned up")
+				}
+				Eventually(verifyJobsDeleted, 60*time.Second).Should(Succeed())
+			})
+		})
+
+		Describe("Status Updates", func() {
+			It("should update status with scan history", func() {
+				scanName := "e2e-history-scan"
+
+				By("creating a ClusterScan with history limit")
+				yaml := createClusterScanYAML(scanName, `
+  historyLimit: 3
+  retainLogs: true
+  scanTemplate:
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'History test scan'; exit 0"]
+    activeDeadlineSeconds: 30
+    backoffLimit: 1`)
+				err := applyYAML(yaml)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for job to complete")
+				verifyCompleted := func(g Gomega) {
+					phase, err := getClusterScanStatus(scanName, "{.status.phase}")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(phase).To(Equal("Completed"))
+				}
+				Eventually(verifyCompleted, 60*time.Second).Should(Succeed())
+
+				By("verifying lastScanResult is populated")
+				verifyLastResult := func(g Gomega) {
+					jobName, err := getClusterScanStatus(scanName, "{.status.lastScanResult.jobName}")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(jobName).NotTo(BeEmpty())
+				}
+				Eventually(verifyLastResult, 30*time.Second).Should(Succeed())
+
+				By("verifying history is populated")
+				verifyHistory := func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "clusterscan", scanName, "-n", testNamespace,
+						"-o", "jsonpath={.status.history}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).NotTo(BeEmpty())
+				}
+				Eventually(verifyHistory, 30*time.Second).Should(Succeed())
+			})
+		})
+
+		Describe("Scheduled Scan", func() {
+			It("should create Jobs on schedule", func() {
+				scanName := "e2e-scheduled-scan"
+
+				By("creating a scheduled ClusterScan (every minute)")
+				yaml := createClusterScanYAML(scanName, `
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  scanTemplate:
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'Scheduled scan at $(date)'; exit 0"]
+    activeDeadlineSeconds: 30
+    backoffLimit: 1`)
+				err := applyYAML(yaml)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("verifying schedule is set in status")
+				verifySchedule := func(g Gomega) {
+					schedule, err := getClusterScanStatus(scanName, "{.spec.schedule}")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(schedule).To(Equal("* * * * *"))
+				}
+				Eventually(verifySchedule, 10*time.Second).Should(Succeed())
+
+				By("waiting for at least one job to be created (may take up to 1 minute)")
+				verifyJobCreated := func(g Gomega) {
+					count, err := countJobsForScan(scanName)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(count).To(BeNumerically(">=", 1), "Expected at least 1 scheduled job")
+				}
+				Eventually(verifyJobCreated, 90*time.Second, 5*time.Second).Should(Succeed())
+
+				By("verifying nextScheduleTime is set")
+				verifyNextSchedule := func(g Gomega) {
+					nextTime, err := getClusterScanStatus(scanName, "{.status.nextScheduleTime}")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(nextTime).NotTo(BeEmpty())
+				}
+				Eventually(verifyNextSchedule, 30*time.Second).Should(Succeed())
+			})
+		})
 	})
 })
 

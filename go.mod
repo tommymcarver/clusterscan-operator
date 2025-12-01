@@ -1,6 +1,6 @@
 module github.com/tommymcarver/clusterscan-operator
 
-go 1.24.6
+go 1.25.4
 
 require (
 	github.com/onsi/ginkgo/v2 v2.22.0

@@ -167,6 +167,8 @@ func (realClock) Now() time.Time { return time.Now() }
 //   - Resource conflicts (handled with optimistic locking)
 //
 // Non-fatal errors (like cleanup failures) are logged but don't stop reconciliation.
+//
+//nolint:gocyclo
 func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -306,7 +308,7 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 
 		log.Info("Created scan job", "job", job.Name)
-		now := metav1.NewTime(r.Clock.Now())
+		now := metav1.NewTime(r.Now())
 		clusterScan.Status.LastScheduleTime = &now
 	}
 
@@ -350,7 +352,7 @@ func (r *ClusterScanReconciler) handleFinalizer(
 	log := logf.FromContext(ctx)
 
 	// Check if the ClusterScan is being deleted
-	if !scan.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !scan.DeletionTimestamp.IsZero() {
 		// Resource is being deleted - handle cleanup
 		if controllerutil.ContainsFinalizer(scan, clusterScanFinalizer) {
 			log.Info("ClusterScan is being deleted, running cleanup")
@@ -412,7 +414,7 @@ func (r *ClusterScanReconciler) handleTriggerSideEffects(
 	switch reason {
 	case TriggerReasonTriggerNow:
 		// Reset triggerNow flag and update LastTriggeredTime
-		now := metav1.NewTime(r.Clock.Now())
+		now := metav1.NewTime(r.Now())
 		scan.Status.LastTriggeredTime = &now
 
 		patch := client.MergeFrom(scan.DeepCopy())
@@ -424,7 +426,7 @@ func (r *ClusterScanReconciler) handleTriggerSideEffects(
 
 	case TriggerReasonAnnotation:
 		// Update last-trigger annotation to prevent re-triggering
-		now := metav1.NewTime(r.Clock.Now())
+		now := metav1.NewTime(r.Now())
 		scan.Status.LastTriggeredTime = &now
 
 		triggerValue := scan.Annotations[triggerAnnotation]
@@ -601,7 +603,7 @@ func (r *ClusterScanReconciler) isScheduledTimeReached(
 		return false, 0
 	}
 
-	now := r.Clock.Now()
+	now := r.Now()
 	var lastScheduleTime time.Time
 
 	if scan.Status.LastScheduleTime != nil {
@@ -650,7 +652,7 @@ func (r *ClusterScanReconciler) getNextScheduleTimeWithParsedCron(scan *scanv1al
 		}
 	}
 
-	now := r.Clock.Now()
+	now := r.Now()
 	return sched.Next(now), nil
 }
 
@@ -681,7 +683,7 @@ func (r *ClusterScanReconciler) constructJobForClusterScan(scan *scanv1alpha1.Cl
 				scanJobLabel: scan.Name,
 			},
 			Annotations: map[string]string{
-				scheduledTimeAnnotation: r.Clock.Now().Format(time.RFC3339),
+				scheduledTimeAnnotation: r.Now().Format(time.RFC3339),
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -981,7 +983,7 @@ func (r *ClusterScanReconciler) getJobLogs(
 	if err != nil {
 		return "", false, fmt.Errorf("failed to get log stream: %w", err)
 	}
-	defer logStream.Close()
+	defer logStream.Close() //nolint:errcheck
 
 	// Read logs
 	var buf bytes.Buffer
