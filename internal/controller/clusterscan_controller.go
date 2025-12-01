@@ -379,12 +379,13 @@ func (r *ClusterScanReconciler) handleFinalizer(
 	// Resource is not being deleted - ensure finalizer is present
 	if !controllerutil.ContainsFinalizer(scan, clusterScanFinalizer) {
 		log.Info("Adding finalizer to ClusterScan")
+		patch := client.MergeFrom(scan.DeepCopy())
 		controllerutil.AddFinalizer(scan, clusterScanFinalizer)
-		if err := r.Update(ctx, scan); err != nil {
+		if err := r.Patch(ctx, scan, patch); err != nil {
 			log.Error(err, "Failed to add finalizer")
 			return false, err
 		}
-		// Re-fetch after update to get the latest resourceVersion
+		// Re-fetch after patch to get the latest resourceVersion
 		if err := r.Get(ctx, namespacedName, scan); err != nil {
 			return false, err
 		}
