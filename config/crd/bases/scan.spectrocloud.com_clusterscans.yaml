@@ -68,14 +68,30 @@ spec:
                 - Forbid
                 - Replace
                 type: string
-              failedScansHistoryLimit:
-                default: 1
+              historyLimit:
+                default: 5
                 description: |-
-                  failedScansHistoryLimit is the number of failed finished scans to retain.
-                  Defaults to 1.
+                  historyLimit is the number of finished scan Jobs and status history entries to retain.
+                  This controls both the Job resources in the cluster and the results in status.history.
+                  Defaults to 5.
                 format: int32
+                maximum: 100
                 minimum: 0
                 type: integer
+              logsMaxBytes:
+                default: 10000
+                description: |-
+                  logsMaxBytes is the maximum number of bytes of logs to retain per scan.
+                  Only used when retainLogs is true. Defaults to 10000 (10KB).
+                format: int32
+                maximum: 100000
+                minimum: 100
+                type: integer
+              retainLogs:
+                description: |-
+                  retainLogs determines whether to capture and store scan logs in status.
+                  Logs are truncated to logsMaxBytes. Defaults to false.
+                type: boolean
               scanTemplate:
                 description: scanTemplate defines the scan job configuration.
                 properties:
@@ -3585,14 +3601,6 @@ spec:
                 format: int64
                 minimum: 0
                 type: integer
-              successfulScansHistoryLimit:
-                default: 3
-                description: |-
-                  successfulScansHistoryLimit is the number of successful finished scans to retain.
-                  Defaults to 3.
-                format: int32
-                minimum: 0
-                type: integer
               suspend:
                 description: |-
                   suspend allows pausing the scheduled scans without deleting the ClusterScan.
@@ -3729,6 +3737,51 @@ spec:
                 description: failedJobs is the total number of failed scan jobs.
                 format: int32
                 type: integer
+              history:
+                description: |-
+                  history contains the results of previous scan executions.
+                  The number of entries is limited by spec.resultsHistoryLimit.
+                  Ordered from oldest to newest.
+                items:
+                  description: ScanResult contains the summary of a scan execution.
+                  properties:
+                    completionTime:
+                      description: completionTime is when the scan finished.
+                      format: date-time
+                      type: string
+                    findings:
+                      description: findings is the number of issues found during the
+                        scan.
+                      format: int32
+                      type: integer
+                    jobName:
+                      description: jobName is the name of the Job that produced this
+                        result.
+                      type: string
+                    logs:
+                      description: |-
+                        logs contains the captured output from the scan container.
+                        Only populated when spec.retainLogs is true.
+                        May be truncated to spec.logsMaxBytes.
+                      type: string
+                    logsTruncated:
+                      description: logsTruncated indicates whether the logs were truncated
+                        due to size limits.
+                      type: boolean
+                    message:
+                      description: message is a human-readable message about the scan
+                        result.
+                      type: string
+                    startTime:
+                      description: startTime is when the scan started.
+                      format: date-time
+                      type: string
+                    succeeded:
+                      description: succeeded indicates whether the scan completed
+                        successfully.
+                      type: boolean
+                  type: object
+                type: array
               lastScanResult:
                 description: lastScanResult contains a summary of the most recent
                   scan result.
@@ -3742,9 +3795,27 @@ spec:
                       scan.
                     format: int32
                     type: integer
+                  jobName:
+                    description: jobName is the name of the Job that produced this
+                      result.
+                    type: string
+                  logs:
+                    description: |-
+                      logs contains the captured output from the scan container.
+                      Only populated when spec.retainLogs is true.
+                      May be truncated to spec.logsMaxBytes.
+                    type: string
+                  logsTruncated:
+                    description: logsTruncated indicates whether the logs were truncated
+                      due to size limits.
+                    type: boolean
                   message:
                     description: message is a human-readable message about the scan
                       result.
+                    type: string
+                  startTime:
+                    description: startTime is when the scan started.
+                    format: date-time
                     type: string
                   succeeded:
                     description: succeeded indicates whether the scan completed successfully.

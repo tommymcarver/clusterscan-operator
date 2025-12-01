@@ -1,9 +1,244 @@
+---
+# ServiceAccount for the scan jobs
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-scanner
+  namespace: default
+---
+# ClusterRole to allow the scanner to read cluster resources
+# Includes broad read permissions needed for Kubevious CLI
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-scanner-role
+rules:
+  # Core resources
+  - apiGroups: [""]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # Apps
+  - apiGroups: ["apps"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # Batch
+  - apiGroups: ["batch"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # Networking
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # RBAC
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # Autoscaling
+  - apiGroups: ["autoscaling"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # Policy
+  - apiGroups: ["policy"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # API Extensions (CRDs)
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # Storage
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+---
+# Bind the ClusterRole to the ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-scanner-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-scanner-role
+subjects:
+  - kind: ServiceAccount
+    name: cluster-scanner
+    namespace: default
+---
+# Example 1: One-off scan (runs immediately once)
 apiVersion: scan.spectrocloud.com/v1alpha1
 kind: ClusterScan
 metadata:
-  labels:
-    app.kubernetes.io/name: clusterscan-operator
-    app.kubernetes.io/managed-by: kustomize
-  name: clusterscan-sample
+  name: quick-scan
+  namespace: default
 spec:
-  # TODO(user): Add fields here
+  # No schedule = one-off job, runs immediately
+  scanTemplate:
+    image: bitnami/kubectl:latest
+    command:
+      - /bin/sh
+      - -c
+    args:
+      - |
+        echo "=== Starting Cluster Scan ==="
+        echo ""
+        echo "=== Namespaces ==="
+        kubectl get namespaces
+        echo ""
+        echo "=== Pods in all namespaces ==="
+        kubectl get pods -A
+        echo ""
+        echo "=== Deployments in all namespaces ==="
+        kubectl get deployments -A
+        echo ""
+        echo "=== Nodes ==="
+        kubectl get nodes
+        echo ""
+        echo "=== Scan Complete ==="
+    serviceAccountName: cluster-scanner
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "50m"
+      limits:
+        memory: "128Mi"
+        cpu: "100m"
+    activeDeadlineSeconds: 300
+    backoffLimit: 2
+---
+# Example 2: Scheduled scan (runs every 5 minutes)
+apiVersion: scan.spectrocloud.com/v1alpha1
+kind: ClusterScan
+metadata:
+  name: scheduled-scan
+  namespace: default
+spec:
+  schedule: "*/5 * * * *"  # Every 5 minutes
+  concurrencyPolicy: Forbid
+  historyLimit: 5  # Keep last 5 scan jobs and results
+  retainLogs: true
+  scanTemplate:
+    image: bitnami/kubectl:latest
+    command:
+      - /bin/sh
+      - -c
+    args:
+      - |
+        echo "=== Scheduled Scan at $(date) ==="
+        echo ""
+        echo "=== Pod Status Summary ==="
+        kubectl get pods -A --no-headers | awk '{print $4}' | sort | uniq -c
+        echo ""
+        echo "=== Pods Not Running ==="
+        kubectl get pods -A --field-selector=status.phase!=Running --no-headers 2>/dev/null || echo "All pods are running!"
+        echo ""
+        echo "=== Resource Usage ==="
+        kubectl top nodes 2>/dev/null || echo "Metrics server not available"
+        echo ""
+        echo "=== Scan Complete ==="
+    serviceAccountName: cluster-scanner
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "50m"
+      limits:
+        memory: "128Mi"
+        cpu: "100m"
+    activeDeadlineSeconds: 120
+---
+# Example 3: Kubevious CLI - Validate live cluster for misconfigurations
+# https://github.com/kubevious/cli
+apiVersion: scan.spectrocloud.com/v1alpha1
+kind: ClusterScan
+metadata:
+  name: kubevious-scan
+  namespace: default
+spec:
+  # One-off scan - runs immediately
+  retainLogs: true
+  logsMaxBytes: 50000  # 50KB to capture detailed output
+  historyLimit: 5
+  scanTemplate:
+    image: kubevious/cli:latest
+    command:
+      - /bin/sh
+      - -c
+    args:
+      - |
+        # Create kubeconfig from in-cluster service account
+        KUBE_API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+        TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        CA_CERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        
+        mkdir -p ~/.kube
+        cat > ~/.kube/config << EOF
+        apiVersion: v1
+        kind: Config
+        clusters:
+        - cluster:
+            certificate-authority: ${CA_CERT}
+            server: ${KUBE_API}
+          name: in-cluster
+        contexts:
+        - context:
+            cluster: in-cluster
+            user: service-account
+          name: in-cluster
+        current-context: in-cluster
+        users:
+        - name: service-account
+          user:
+            token: ${TOKEN}
+        EOF
+        
+        echo "=== Kubevious Cluster Scan ==="
+        echo "Scanning namespace: default"
+        echo ""
+        
+        # Run Kubevious guard against live cluster
+        # Use --skip-rules to ignore known false positives for system bindings
+        kubevious guard --live-k8s --include-remote-targets --namespace default \
+          --skip-rules role-binding-service-account-ref || true
+        
+        echo ""
+        echo "Note: Some system binding warnings are expected in Kind/local clusters"
+    serviceAccountName: cluster-scanner
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
+    activeDeadlineSeconds: 600  # 10 minutes
+    backoffLimit: 1
+---
+# Example 4: Popeye One-off Scan (runs immediately)
+apiVersion: scan.spectrocloud.com/v1alpha1
+kind: ClusterScan
+metadata:
+  name: popeye-quick
+  namespace: default
+spec:
+  # No schedule = one-off, runs immediately
+  retainLogs: true
+  logsMaxBytes: 100000
+  historyLimit: 3
+  scanTemplate:
+    image: derailed/popeye:v0.22.1
+    args:
+      - -o
+      - standard
+      - -n
+      - default       # Only scan default namespace
+      - --force-exit-zero
+    serviceAccountName: cluster-scanner
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "500m"
+    activeDeadlineSeconds: 180
+    backoffLimit: 1
+---

@@ -63,19 +63,27 @@ type ClusterScanSpec struct {
 	// +kubebuilder:default=Forbid
 	ConcurrencyPolicy ConcurrencyPolicy `json:"concurrencyPolicy,omitempty"`
 
-	// successfulScansHistoryLimit is the number of successful finished scans to retain.
-	// Defaults to 3.
+	// historyLimit is the number of finished scan Jobs and status history entries to retain.
+	// This controls both the Job resources in the cluster and the results in status.history.
+	// Defaults to 5.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default=3
-	SuccessfulScansHistoryLimit *int32 `json:"successfulScansHistoryLimit,omitempty"`
+	// +kubebuilder:validation:Maximum=100
+	// +kubebuilder:default=5
+	HistoryLimit *int32 `json:"historyLimit,omitempty"`
 
-	// failedScansHistoryLimit is the number of failed finished scans to retain.
-	// Defaults to 1.
+	// retainLogs determines whether to capture and store scan logs in status.
+	// Logs are truncated to logsMaxBytes. Defaults to false.
 	// +optional
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default=1
-	FailedScansHistoryLimit *int32 `json:"failedScansHistoryLimit,omitempty"`
+	RetainLogs bool `json:"retainLogs,omitempty"`
+
+	// logsMaxBytes is the maximum number of bytes of logs to retain per scan.
+	// Only used when retainLogs is true. Defaults to 10000 (10KB).
+	// +optional
+	// +kubebuilder:validation:Minimum=100
+	// +kubebuilder:validation:Maximum=100000
+	// +kubebuilder:default=10000
+	LogsMaxBytes *int32 `json:"logsMaxBytes,omitempty"`
 
 	// startingDeadlineSeconds is the optional deadline in seconds for starting the scan
 	// if it misses its scheduled time for any reason. Missed scans will be counted as failed.
@@ -224,6 +232,12 @@ type ClusterScanStatus struct {
 	// +optional
 	LastScanResult *ScanResult `json:"lastScanResult,omitempty"`
 
+	// history contains the results of previous scan executions.
+	// The number of entries is limited by spec.resultsHistoryLimit.
+	// Ordered from oldest to newest.
+	// +optional
+	History []ScanResult `json:"history,omitempty"`
+
 	// nextScheduleTime is the next time a scan is scheduled to run.
 	// Only set for scheduled scans.
 	// +optional
@@ -236,6 +250,14 @@ type ClusterScanStatus struct {
 
 // ScanResult contains the summary of a scan execution.
 type ScanResult struct {
+	// jobName is the name of the Job that produced this result.
+	// +optional
+	JobName string `json:"jobName,omitempty"`
+
+	// startTime is when the scan started.
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+
 	// completionTime is when the scan finished.
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
@@ -251,6 +273,16 @@ type ScanResult struct {
 	// findings is the number of issues found during the scan.
 	// +optional
 	Findings *int32 `json:"findings,omitempty"`
+
+	// logs contains the captured output from the scan container.
+	// Only populated when spec.retainLogs is true.
+	// May be truncated to spec.logsMaxBytes.
+	// +optional
+	Logs string `json:"logs,omitempty"`
+
+	// logsTruncated indicates whether the logs were truncated due to size limits.
+	// +optional
+	LogsTruncated bool `json:"logsTruncated,omitempty"`
 }
 
 // +kubebuilder:object:root=true
