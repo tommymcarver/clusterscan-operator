@@ -181,10 +181,11 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var clusterScan scanv1alpha1.ClusterScan
 	if err := r.Get(ctx, req.NamespacedName, &clusterScan); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Info("ClusterScan resource not found, ignoring")
+			// Resource was deleted before reconcile - this is normal
+			log.V(1).Info("ClusterScan not found, likely deleted")
 			return ctrl.Result{}, nil
 		}
-		log.Error(err, "Failed to get ClusterScan")
+		log.Error(err, "Unable to fetch ClusterScan")
 		return ctrl.Result{}, err
 	}
 
@@ -199,7 +200,7 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// List all jobs owned by this ClusterScan
 	var childJobs batchv1.JobList
 	if err := r.List(ctx, &childJobs, client.InNamespace(req.Namespace), client.MatchingFields{jobOwnerKey: req.Name}); err != nil {
-		log.Error(err, "Failed to list child Jobs")
+		log.Error(err, "Unable to list child Jobs")
 		return ctrl.Result{}, err
 	}
 
@@ -259,8 +260,8 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Clean up old jobs based on history limits
 	if err := r.cleanupOldJobs(ctx, &clusterScan, successfulJobs, failedJobs); err != nil {
-		log.Error(err, "Failed to clean up old jobs")
-		// Continue reconciliation even if cleanup fails
+		// Non-fatal: log warning but continue reconciliation
+		log.V(1).Info("Unable to clean up old jobs", "error", err)
 	}
 
 	// Determine if we should create a new job and why
@@ -276,21 +277,18 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if shouldCreate && len(activeJobs) > 0 {
 		switch clusterScan.Spec.ConcurrencyPolicy {
 		case scanv1alpha1.ForbidConcurrent, "":
-			// Use V(1) debug level to reduce log noise during normal operation
-			log.V(1).Info("Concurrency policy is Forbid and job is active, skipping",
-				"activeJobs", len(activeJobs))
+			log.V(1).Info("Skipping: job already active (policy=Forbid)", "activeJobs", len(activeJobs))
 			shouldCreate = false
 		case scanv1alpha1.ReplaceConcurrent:
-			log.Info("Concurrency policy is Replace, deleting active jobs",
-				"activeJobs", len(activeJobs))
+			log.Info("Replacing active jobs (policy=Replace)", "count", len(activeJobs))
 			for _, job := range activeJobs {
 				if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-					log.Error(err, "Failed to delete active job", "job", job.Name)
+					log.Error(err, "Unable to delete active job", "job", job.Name)
 					return ctrl.Result{}, err
 				}
 			}
 		case scanv1alpha1.AllowConcurrent:
-			log.V(1).Info("Concurrency policy is Allow, creating additional job")
+			log.V(1).Info("Creating concurrent job (policy=Allow)", "activeJobs", len(activeJobs))
 		}
 	}
 
@@ -298,16 +296,16 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if shouldCreate {
 		job, err := r.constructJobForClusterScan(&clusterScan)
 		if err != nil {
-			log.Error(err, "Failed to construct job")
+			log.Error(err, "Unable to construct job from template")
 			return ctrl.Result{}, err
 		}
 
 		if err := r.Create(ctx, job); err != nil {
-			log.Error(err, "Failed to create Job")
+			log.Error(err, "Unable to create Job", "job", job.Name)
 			return ctrl.Result{}, err
 		}
 
-		log.Info("Created scan job", "job", job.Name)
+		log.Info("Scan job created", "job", job.Name, "trigger", triggerReason)
 		now := metav1.NewTime(r.Now())
 		clusterScan.Status.LastScheduleTime = &now
 	}
@@ -316,7 +314,7 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if clusterScan.Spec.Schedule != "" {
 		nextTime, err := r.getNextScheduleTime(&clusterScan)
 		if err != nil {
-			log.Error(err, "Failed to parse schedule")
+			log.Error(err, "Invalid cron schedule", "schedule", clusterScan.Spec.Schedule)
 		} else {
 			clusterScan.Status.NextScheduleTime = &metav1.Time{Time: nextTime}
 			// Requeue at next schedule time
@@ -328,7 +326,7 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Update status using patch (more resilient to conflicts than update)
 	if err := r.updateStatus(ctx, req.NamespacedName, clusterScan.Status); err != nil {
-		log.Error(err, "Failed to update ClusterScan status")
+		log.Error(err, "Unable to update status")
 		return ctrl.Result{}, err
 	}
 
@@ -355,19 +353,24 @@ func (r *ClusterScanReconciler) handleFinalizer(
 	if !scan.DeletionTimestamp.IsZero() {
 		// Resource is being deleted - handle cleanup
 		if controllerutil.ContainsFinalizer(scan, clusterScanFinalizer) {
-			log.Info("ClusterScan is being deleted, running cleanup")
+			log.V(1).Info("Processing deletion, cleaning up child resources")
 
 			// Perform cleanup of child resources
 			if err := r.cleanupOnDelete(ctx, scan); err != nil {
-				log.Error(err, "Failed to cleanup ClusterScan")
+				log.Error(err, "Unable to cleanup child resources")
 				return false, err
 			}
 
 			// Remove finalizer to allow deletion to proceed
-			log.Info("Removing finalizer from ClusterScan")
+			log.V(1).Info("Removing finalizer")
 			controllerutil.RemoveFinalizer(scan, clusterScanFinalizer)
 			if err := r.Update(ctx, scan); err != nil {
-				log.Error(err, "Failed to remove finalizer")
+				// If resource is already gone, that's fine - deletion succeeded
+				if apierrors.IsNotFound(err) {
+					log.V(1).Info("Resource already deleted")
+					return false, nil
+				}
+				log.Error(err, "Unable to remove finalizer")
 				return false, err
 			}
 		}
@@ -378,11 +381,11 @@ func (r *ClusterScanReconciler) handleFinalizer(
 
 	// Resource is not being deleted - ensure finalizer is present
 	if !controllerutil.ContainsFinalizer(scan, clusterScanFinalizer) {
-		log.Info("Adding finalizer to ClusterScan")
+		log.V(1).Info("Adding finalizer")
 		patch := client.MergeFrom(scan.DeepCopy())
 		controllerutil.AddFinalizer(scan, clusterScanFinalizer)
 		if err := r.Patch(ctx, scan, patch); err != nil {
-			log.Error(err, "Failed to add finalizer")
+			log.Error(err, "Unable to add finalizer")
 			return false, err
 		}
 		// Re-fetch after patch to get the latest resourceVersion
@@ -421,7 +424,7 @@ func (r *ClusterScanReconciler) handleTriggerSideEffects(
 		patch := client.MergeFrom(scan.DeepCopy())
 		scan.Spec.TriggerNow = false
 		if err := r.Patch(ctx, scan, patch); err != nil {
-			log.Error(err, "Failed to reset triggerNow flag")
+			log.Error(err, "Unable to reset triggerNow flag")
 			return err
 		}
 
@@ -437,7 +440,7 @@ func (r *ClusterScanReconciler) handleTriggerSideEffects(
 		}
 		scan.Annotations[lastTriggerAnnotation] = triggerValue
 		if err := r.Patch(ctx, scan, patch); err != nil {
-			log.Error(err, "Failed to update trigger annotation")
+			log.Error(err, "Unable to update trigger annotation")
 			return err
 		}
 		// Re-fetch after patch to get updated resourceVersion
@@ -490,20 +493,16 @@ func (r *ClusterScanReconciler) determinePhase(
 
 	// For scheduled scans, show the result of the last job
 	// Since successfulJobs and failedJobs are already sorted, just compare the last element of each
-	lastJob := getMostRecentJob(successfulJobs, failedJobs)
+	lastJob, wasSuccessful := getMostRecentJobWithStatus(successfulJobs, failedJobs)
 	if lastJob == nil {
 		return scanv1alpha1.ScanPhasePending
 	}
 
-	finished, finishedType := isJobFinished(lastJob)
-	if finished {
-		if finishedType == batchv1.JobComplete {
-			return scanv1alpha1.ScanPhaseCompleted
-		}
-		return scanv1alpha1.ScanPhaseFailed
+	// We already know the job is finished (it's in one of the finished arrays)
+	if wasSuccessful {
+		return scanv1alpha1.ScanPhaseCompleted
 	}
-
-	return scanv1alpha1.ScanPhaseRunning
+	return scanv1alpha1.ScanPhaseFailed
 }
 
 // TriggerReason indicates why a job should be created.
@@ -546,13 +545,13 @@ func (r *ClusterScanReconciler) shouldCreateJob(
 
 	// Check if suspended - never create jobs when suspended
 	if scan.Spec.Suspend != nil && *scan.Spec.Suspend {
-		log.V(1).Info("ClusterScan is suspended, skipping job creation")
+		log.V(1).Info("Scan suspended, skipping")
 		return TriggerReasonNone, 0
 	}
 
 	// Check triggerNow field (highest priority manual trigger)
 	if scan.Spec.TriggerNow {
-		log.Info("TriggerNow is set, will create job immediately")
+		log.V(1).Info("Trigger: triggerNow=true")
 		return TriggerReasonTriggerNow, 0
 	}
 
@@ -560,7 +559,7 @@ func (r *ClusterScanReconciler) shouldCreateJob(
 	if triggerValue, ok := scan.Annotations[triggerAnnotation]; ok && triggerValue != "" {
 		lastTrigger := scan.Annotations[lastTriggerAnnotation]
 		if triggerValue != lastTrigger {
-			log.Info("Trigger annotation detected", "trigger", triggerValue)
+			log.V(1).Info("Trigger: annotation", "value", triggerValue)
 			return TriggerReasonAnnotation, 0
 		}
 	}
@@ -600,7 +599,7 @@ func (r *ClusterScanReconciler) isScheduledTimeReached(
 
 	sched, err := cron.ParseStandard(scan.Spec.Schedule)
 	if err != nil {
-		log.Error(err, "Failed to parse schedule")
+		log.Error(err, "Invalid cron schedule", "schedule", scan.Spec.Schedule)
 		return false, 0
 	}
 
@@ -620,7 +619,7 @@ func (r *ClusterScanReconciler) isScheduledTimeReached(
 	if scan.Spec.StartingDeadlineSeconds != nil {
 		deadline := nextSchedule.Add(time.Duration(*scan.Spec.StartingDeadlineSeconds) * time.Second)
 		if now.After(deadline) {
-			log.Info("Missed starting deadline", "deadline", deadline)
+			log.V(1).Info("Missed scheduled time, skipping to next", "missed", nextSchedule, "deadline", deadline)
 			// We missed this schedule, find the next one
 			nextSchedule = sched.Next(now)
 		}
@@ -1054,7 +1053,7 @@ func (r *ClusterScanReconciler) cleanupOnDelete(ctx context.Context, scan *scanv
 	// containers a chance to receive SIGTERM and clean up gracefully.
 	for i := range childJobs.Items {
 		job := &childJobs.Items[i]
-		log.Info("Deleting child job", "job", job.Name)
+		log.V(1).Info("Deleting child job", "job", job.Name)
 
 		if err := r.Delete(ctx, job,
 			client.PropagationPolicy(metav1.DeletePropagationForeground),
@@ -1063,7 +1062,7 @@ func (r *ClusterScanReconciler) cleanupOnDelete(ctx context.Context, scan *scanv
 		}
 	}
 
-	log.Info("Cleanup completed", "deletedJobs", len(childJobs.Items))
+	log.V(1).Info("Cleanup completed", "deletedJobs", len(childJobs.Items))
 	return nil
 }
 
@@ -1133,6 +1132,14 @@ func sortJobsByStartTime(jobs []*batchv1.Job) {
 // getMostRecentJob returns the job with the latest start time from two pre-sorted slices.
 // This is O(1) since we only need to compare the last element of each slice.
 func getMostRecentJob(sortedA, sortedB []*batchv1.Job) *batchv1.Job {
+	job, _ := getMostRecentJobWithStatus(sortedA, sortedB)
+	return job
+}
+
+// getMostRecentJobWithStatus returns the job with the latest start time from two pre-sorted slices,
+// along with a boolean indicating if the job came from the first slice (sortedA).
+// This avoids redundant isJobFinished calls when we already know which array contains successful/failed jobs.
+func getMostRecentJobWithStatus(sortedA, sortedB []*batchv1.Job) (*batchv1.Job, bool) {
 	var lastA, lastB *batchv1.Job
 
 	if len(sortedA) > 0 {
@@ -1143,24 +1150,24 @@ func getMostRecentJob(sortedA, sortedB []*batchv1.Job) *batchv1.Job {
 	}
 
 	if lastA == nil {
-		return lastB
+		return lastB, false // from B (or nil)
 	}
 	if lastB == nil {
-		return lastA
+		return lastA, true // from A
 	}
 
 	// Compare start times
 	if lastA.Status.StartTime == nil {
-		return lastB
+		return lastB, false
 	}
 	if lastB.Status.StartTime == nil {
-		return lastA
+		return lastA, true
 	}
 
 	if lastA.Status.StartTime.After(lastB.Status.StartTime.Time) {
-		return lastA
+		return lastA, true
 	}
-	return lastB
+	return lastB, false
 }
 
 // mergeSortedJobs merges two pre-sorted job slices into one sorted slice.
