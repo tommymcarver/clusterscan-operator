@@ -175,64 +175,6 @@ var _ = Describe("ClusterScan Controller", func() {
 		})
 	})
 
-	Describe("getMostRecentJob", func() {
-		It("should return nil for empty slices", func() {
-			result := getMostRecentJob(nil, nil)
-			Expect(result).To(BeNil())
-		})
-
-		It("should return nil for two empty slices", func() {
-			result := getMostRecentJob([]*batchv1.Job{}, []*batchv1.Job{})
-			Expect(result).To(BeNil())
-		})
-
-		It("should return the only job when one slice is empty", func() {
-			now := time.Now()
-			jobA := &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{Name: "jobA"},
-				Status:     batchv1.JobStatus{StartTime: &metav1.Time{Time: now}},
-			}
-
-			result := getMostRecentJob([]*batchv1.Job{jobA}, nil)
-			Expect(result).To(Equal(jobA))
-
-			result = getMostRecentJob(nil, []*batchv1.Job{jobA})
-			Expect(result).To(Equal(jobA))
-		})
-
-		It("should return the most recent job from sorted slices", func() {
-			now := time.Now()
-			older := &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{Name: "older"},
-				Status:     batchv1.JobStatus{StartTime: &metav1.Time{Time: now}},
-			}
-			newer := &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{Name: "newer"},
-				Status:     batchv1.JobStatus{StartTime: &metav1.Time{Time: now.Add(1 * time.Hour)}},
-			}
-
-			result := getMostRecentJob([]*batchv1.Job{older}, []*batchv1.Job{newer})
-			Expect(result.Name).To(Equal("newer"))
-
-			result = getMostRecentJob([]*batchv1.Job{newer}, []*batchv1.Job{older})
-			Expect(result.Name).To(Equal("newer"))
-		})
-
-		It("should handle nil start times", func() {
-			jobWithTime := &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{Name: "withTime"},
-				Status:     batchv1.JobStatus{StartTime: &metav1.Time{Time: time.Now()}},
-			}
-			jobWithoutTime := &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{Name: "withoutTime"},
-				Status:     batchv1.JobStatus{StartTime: nil},
-			}
-
-			result := getMostRecentJob([]*batchv1.Job{jobWithTime}, []*batchv1.Job{jobWithoutTime})
-			Expect(result.Name).To(Equal("withTime"))
-		})
-	})
-
 	Describe("mergeSortedJobs", func() {
 		It("should return empty slice for empty inputs", func() {
 			result := mergeSortedJobs(nil, nil)
@@ -506,16 +448,16 @@ var _ = Describe("ClusterScan Controller", func() {
 			scan.Spec.Suspend = ptr.To(true)
 			scan.Spec.TriggerNow = true // Should be ignored
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
-			Expect(reason).To(Equal(TriggerReasonNone))
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			Expect(result.reason).To(Equal(TriggerReasonNone))
 		})
 
 		It("should return TriggerReasonTriggerNow when triggerNow is set", func() {
 			scan := newTestClusterScan("test", "default")
 			scan.Spec.TriggerNow = true
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
-			Expect(reason).To(Equal(TriggerReasonTriggerNow))
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			Expect(result.reason).To(Equal(TriggerReasonTriggerNow))
 		})
 
 		It("should return TriggerReasonAnnotation when trigger annotation is set", func() {
@@ -524,8 +466,8 @@ var _ = Describe("ClusterScan Controller", func() {
 				triggerAnnotation: "12345",
 			}
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
-			Expect(reason).To(Equal(TriggerReasonAnnotation))
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			Expect(result.reason).To(Equal(TriggerReasonAnnotation))
 		})
 
 		It("should return TriggerReasonOneOff when annotation already processed for new one-off scan", func() {
@@ -536,10 +478,10 @@ var _ = Describe("ClusterScan Controller", func() {
 			}
 			// No schedule, no LastScheduleTime = one-off scan that hasn't run yet
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
 			// Since trigger annotation is same, it falls through to one-off check
 			// and since the scan hasn't run yet (no LastScheduleTime), it returns OneOff
-			Expect(reason).To(Equal(TriggerReasonOneOff))
+			Expect(result.reason).To(Equal(TriggerReasonOneOff))
 		})
 
 		It("should return TriggerReasonNone when annotation already processed and scan already ran", func() {
@@ -552,16 +494,16 @@ var _ = Describe("ClusterScan Controller", func() {
 			now := metav1.NewTime(time.Now())
 			scan.Status.LastScheduleTime = &now
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
-			Expect(reason).To(Equal(TriggerReasonNone))
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			Expect(result.reason).To(Equal(TriggerReasonNone))
 		})
 
 		It("should return TriggerReasonOneOff for new one-off scan", func() {
 			scan := newTestClusterScan("test", "default")
 			// No schedule, no LastScheduleTime, no jobs
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
-			Expect(reason).To(Equal(TriggerReasonOneOff))
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			Expect(result.reason).To(Equal(TriggerReasonOneOff))
 		})
 
 		It("should return TriggerReasonNone for already-run one-off scan", func() {
@@ -569,46 +511,43 @@ var _ = Describe("ClusterScan Controller", func() {
 			now := metav1.NewTime(time.Now())
 			scan.Status.LastScheduleTime = &now
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
-			Expect(reason).To(Equal(TriggerReasonNone))
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			Expect(result.reason).To(Equal(TriggerReasonNone))
 		})
 
 		It("should return TriggerReasonSchedule when schedule time reached", func() {
 			scan := newTestClusterScan("test", "default")
 			scan.Spec.Schedule = fiveMinuteCronSchedule // Every 5 minutes
 			// Clock is set to 00:05:00, which is a 5-minute boundary
+			scan.CreationTimestamp = metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
-			Expect(reason).To(Equal(TriggerReasonSchedule))
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			Expect(result.reason).To(Equal(TriggerReasonSchedule))
 		})
 
 		It("should return TriggerReasonNone for scheduled scan not yet due", func() {
-			// Use real time for this test since time.Until uses system clock
-			now := time.Now().Truncate(time.Minute)
-			lastSchedule := now.Add(-1 * time.Minute)
-			clock.currentTime = now
+			// Set deterministic test time
+			clock.currentTime = time.Date(2025, 1, 1, 0, 3, 0, 0, time.UTC) // 00:03
 
 			scan := newTestClusterScan("test", "default")
 			scan.Spec.Schedule = fiveMinuteCronSchedule // Every 5 minutes
-			scan.Status.LastScheduleTime = &metav1.Time{Time: lastSchedule}
+			// Created at 00:00, last schedule at 00:00, clock at 00:03 - next is 00:05
+			scan.CreationTimestamp = metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
+			scan.Status.LastScheduleTime = &metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
-			// The check is whether it's time to run - if last schedule was 1 minute ago
-			// and we're on a */5 schedule, we need to check if we're past the next 5-minute mark
-
-			// The actual result depends on current time alignment with 5-minute boundaries
-			// For this test, we just verify it returns a valid reason (either Schedule if due, or None if not)
-			Expect(reason).To(BeElementOf(TriggerReasonNone, TriggerReasonSchedule))
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			Expect(result.reason).To(Equal(TriggerReasonNone))
 		})
 
 		It("should prioritize triggerNow over schedule", func() {
 			scan := newTestClusterScan("test", "default")
 			scan.Spec.Schedule = "0 0 * * *" // Daily at midnight (not due)
 			scan.Spec.TriggerNow = true
+			scan.CreationTimestamp = metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
 			clock.currentTime = time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC) // Noon
 
-			reason, _ := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
-			Expect(reason).To(Equal(TriggerReasonTriggerNow))
+			result := reconciler.shouldCreateJob(context.Background(), scan, nil, nil)
+			Expect(result.reason).To(Equal(TriggerReasonTriggerNow))
 		})
 	})
 
@@ -890,69 +829,10 @@ var _ = Describe("ClusterScan Controller", func() {
 	})
 
 	// ============================================================
-	// getNextScheduleTime Tests
+	// isScheduledTimeReached Tests
 	// ============================================================
 
-	Describe("getNextScheduleTime", func() {
-		var (
-			reconciler *ClusterScanReconciler
-			clock      *mockClock
-		)
-
-		BeforeEach(func() {
-			clock = &mockClock{currentTime: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
-			reconciler = &ClusterScanReconciler{
-				Clock: clock,
-			}
-		})
-
-		It("should return next time for valid cron schedule", func() {
-			scan := newTestClusterScan("test", "default")
-			scan.Spec.Schedule = fiveMinuteCronSchedule // Every 5 minutes
-
-			nextTime, err := reconciler.getNextScheduleTime(scan)
-
-			Expect(err).NotTo(HaveOccurred())
-			Expect(nextTime).To(Equal(time.Date(2025, 1, 1, 0, 5, 0, 0, time.UTC)))
-		})
-
-		It("should return error for invalid cron schedule", func() {
-			scan := newTestClusterScan("test", "default")
-			scan.Spec.Schedule = "invalid cron"
-
-			_, err := reconciler.getNextScheduleTime(scan)
-
-			Expect(err).To(HaveOccurred())
-		})
-
-		It("should handle hourly schedule", func() {
-			scan := newTestClusterScan("test", "default")
-			scan.Spec.Schedule = "0 * * * *" // Every hour at minute 0
-
-			nextTime, err := reconciler.getNextScheduleTime(scan)
-
-			Expect(err).NotTo(HaveOccurred())
-			Expect(nextTime).To(Equal(time.Date(2025, 1, 1, 1, 0, 0, 0, time.UTC)))
-		})
-
-		It("should handle daily schedule", func() {
-			clock.currentTime = time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC) // Noon
-			scan := newTestClusterScan("test", "default")
-			scan.Spec.Schedule = "0 0 * * *" // Daily at midnight
-
-			nextTime, err := reconciler.getNextScheduleTime(scan)
-
-			Expect(err).NotTo(HaveOccurred())
-			// Next midnight is Jan 2
-			Expect(nextTime).To(Equal(time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)))
-		})
-	})
-
-	// ============================================================
-	// isScheduledTimeReached Tests (Additional)
-	// ============================================================
-
-	Describe("isScheduledTimeReached (extended)", func() {
+	Describe("isScheduledTimeReached", func() {
 		var (
 			reconciler *ClusterScanReconciler
 			clock      *mockClock
@@ -965,36 +845,76 @@ var _ = Describe("ClusterScan Controller", func() {
 			}
 		})
 
-		It("should return true when schedule time is reached", func() {
+		It("should return reached=true and next schedule time when schedule time is reached", func() {
 			scan := newTestClusterScan("test", "default")
 			scan.Spec.Schedule = fiveMinuteCronSchedule
-			// Created at 00:00, clock at 00:05
+			// Set creation time to 00:00, clock is at 00:05
+			scan.CreationTimestamp = metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
 
-			reached, _ := reconciler.isScheduledTimeReached(context.Background(), scan)
-			Expect(reached).To(BeTrue())
+			info := reconciler.isScheduledTimeReached(context.Background(), scan)
+			Expect(info.reached).To(BeTrue())
+			// Next schedule after 00:05 should be 00:10
+			Expect(info.nextScheduleTime).To(Equal(time.Date(2025, 1, 1, 0, 10, 0, 0, time.UTC)))
+			Expect(info.waitDuration).To(Equal(5 * time.Minute))
+		})
+
+		It("should return reached=false with correct next time when not yet due", func() {
+			clock.currentTime = time.Date(2025, 1, 1, 0, 3, 0, 0, time.UTC) // 00:03
+			scan := newTestClusterScan("test", "default")
+			scan.Spec.Schedule = fiveMinuteCronSchedule
+			// Created at 00:00, clock at 00:03, next should be 00:05
+			scan.CreationTimestamp = metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
+
+			info := reconciler.isScheduledTimeReached(context.Background(), scan)
+			Expect(info.reached).To(BeFalse())
+			Expect(info.nextScheduleTime).To(Equal(time.Date(2025, 1, 1, 0, 5, 0, 0, time.UTC)))
+			Expect(info.waitDuration).To(Equal(2 * time.Minute))
+		})
+
+		It("should handle hourly schedule", func() {
+			clock.currentTime = time.Date(2025, 1, 1, 0, 30, 0, 0, time.UTC) // 00:30
+			scan := newTestClusterScan("test", "default")
+			scan.Spec.Schedule = "0 * * * *" // Every hour at minute 0
+			scan.CreationTimestamp = metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
+
+			info := reconciler.isScheduledTimeReached(context.Background(), scan)
+			Expect(info.reached).To(BeFalse())
+			Expect(info.nextScheduleTime).To(Equal(time.Date(2025, 1, 1, 1, 0, 0, 0, time.UTC)))
+			Expect(info.waitDuration).To(Equal(30 * time.Minute))
+		})
+
+		It("should handle daily schedule", func() {
+			clock.currentTime = time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC) // Noon
+			scan := newTestClusterScan("test", "default")
+			scan.Spec.Schedule = "0 0 * * *" // Daily at midnight
+			scan.CreationTimestamp = metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
+
+			info := reconciler.isScheduledTimeReached(context.Background(), scan)
+			Expect(info.reached).To(BeFalse())
+			// Next midnight is Jan 2
+			Expect(info.nextScheduleTime).To(Equal(time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)))
 		})
 
 		It("should handle starting deadline seconds", func() {
 			scan := newTestClusterScan("test", "default")
 			scan.Spec.Schedule = fiveMinuteCronSchedule
 			scan.Spec.StartingDeadlineSeconds = ptr.To(int64(60)) // 1 minute deadline
+			scan.CreationTimestamp = metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
 
-			// This test verifies the deadline logic path is executed
-			// The log message "Missed starting deadline" should appear
-			reached, _ := reconciler.isScheduledTimeReached(context.Background(), scan)
-
-			// The schedule should be triggered (either now or after deadline handling)
-			// We just verify it doesn't panic and returns a valid value
-			Expect(reached).To(BeElementOf(true, false))
+			info := reconciler.isScheduledTimeReached(context.Background(), scan)
+			// We just verify it doesn't panic and returns valid values
+			Expect(info.reached).To(BeElementOf(true, false))
 		})
 
-		It("should return error for invalid schedule", func() {
+		It("should return zero values for invalid schedule", func() {
 			scan := newTestClusterScan("test", "default")
 			scan.Spec.Schedule = "not-a-cron"
+			scan.CreationTimestamp = metav1.Time{Time: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)}
 
-			reached, requeueAfter := reconciler.isScheduledTimeReached(context.Background(), scan)
-			Expect(reached).To(BeFalse())
-			Expect(requeueAfter).To(Equal(time.Duration(0)))
+			info := reconciler.isScheduledTimeReached(context.Background(), scan)
+			Expect(info.reached).To(BeFalse())
+			Expect(info.waitDuration).To(Equal(time.Duration(0)))
+			Expect(info.nextScheduleTime.IsZero()).To(BeTrue())
 		})
 	})
 

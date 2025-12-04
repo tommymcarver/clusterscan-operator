@@ -265,11 +265,11 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Determine if we should create a new job and why
-	triggerReason, requeueAfter := r.shouldCreateJob(ctx, &clusterScan, activeJobs, successfulJobs)
-	shouldCreate := triggerReason != TriggerReasonNone
+	trigger := r.shouldCreateJob(ctx, &clusterScan, activeJobs, successfulJobs)
+	shouldCreate := trigger.reason != TriggerReasonNone
 
 	// Handle side effects based on trigger reason
-	if err := r.handleTriggerSideEffects(ctx, &clusterScan, triggerReason, req.NamespacedName); err != nil {
+	if err := r.handleTriggerSideEffects(ctx, &clusterScan, trigger.reason, req.NamespacedName); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -305,23 +305,16 @@ func (r *ClusterScanReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, err
 		}
 
-		log.Info("Scan job created", "job", job.Name, "trigger", triggerReason)
+		log.Info("Scan job created", "job", job.Name, "trigger", trigger.reason)
 		now := metav1.NewTime(r.Now())
 		clusterScan.Status.LastScheduleTime = &now
 	}
 
-	// Calculate next schedule time for scheduled scans
-	if clusterScan.Spec.Schedule != "" {
-		nextTime, err := r.getNextScheduleTime(&clusterScan)
-		if err != nil {
-			log.Error(err, "Invalid cron schedule", "schedule", clusterScan.Spec.Schedule)
-		} else {
-			clusterScan.Status.NextScheduleTime = &metav1.Time{Time: nextTime}
-			// Requeue at next schedule time
-			if requeueAfter == 0 || time.Until(nextTime) < requeueAfter {
-				requeueAfter = time.Until(nextTime)
-			}
-		}
+	// Set next schedule time for scheduled scans (reusing info from shouldCreateJob)
+	var requeueAfter time.Duration
+	if clusterScan.Spec.Schedule != "" && !trigger.schedule.nextScheduleTime.IsZero() {
+		clusterScan.Status.NextScheduleTime = &metav1.Time{Time: trigger.schedule.nextScheduleTime}
+		requeueAfter = trigger.schedule.waitDuration
 	}
 
 	// Update status using patch (more resilient to conflicts than update)
@@ -521,6 +514,14 @@ const (
 	TriggerReasonAnnotation TriggerReason = "Annotation"
 )
 
+// triggerResult contains the result of shouldCreateJob evaluation.
+type triggerResult struct {
+	// reason indicates why a job should be created (empty if it shouldn't)
+	reason TriggerReason
+	// scheduleInfo contains schedule timing info (only for scheduled scans)
+	schedule scheduleInfo
+}
+
 // shouldCreateJob determines if a new job should be created and why.
 //
 // This function consolidates all trigger logic into one place:
@@ -530,9 +531,9 @@ const (
 //   - TriggerNow field
 //   - Trigger annotation
 //
-// Returns:
+// Returns triggerResult containing:
 //   - reason: Why the job should be created (empty if it shouldn't)
-//   - requeueAfter: Duration until next schedule (for scheduled scans)
+//   - schedule: Schedule timing info (for scheduled scans)
 //
 // Note: This function does NOT perform side effects (resetting triggerNow, etc.).
 // The caller is responsible for handling side effects based on the returned reason.
@@ -540,19 +541,19 @@ func (r *ClusterScanReconciler) shouldCreateJob(
 	ctx context.Context,
 	scan *scanv1alpha1.ClusterScan,
 	activeJobs, successfulJobs []*batchv1.Job,
-) (TriggerReason, time.Duration) {
+) triggerResult {
 	log := logf.FromContext(ctx)
 
 	// Check if suspended - never create jobs when suspended
 	if scan.Spec.Suspend != nil && *scan.Spec.Suspend {
 		log.V(1).Info("Scan suspended, skipping")
-		return TriggerReasonNone, 0
+		return triggerResult{reason: TriggerReasonNone}
 	}
 
 	// Check triggerNow field (highest priority manual trigger)
 	if scan.Spec.TriggerNow {
 		log.V(1).Info("Trigger: triggerNow=true")
-		return TriggerReasonTriggerNow, 0
+		return triggerResult{reason: TriggerReasonTriggerNow}
 	}
 
 	// Check trigger annotation
@@ -560,24 +561,34 @@ func (r *ClusterScanReconciler) shouldCreateJob(
 		lastTrigger := scan.Annotations[lastTriggerAnnotation]
 		if triggerValue != lastTrigger {
 			log.V(1).Info("Trigger: annotation", "value", triggerValue)
-			return TriggerReasonAnnotation, 0
+			return triggerResult{reason: TriggerReasonAnnotation}
 		}
 	}
 
 	// One-off scan (no schedule) - only create if no jobs exist
 	if scan.Spec.Schedule == "" {
 		if scan.Status.LastScheduleTime == nil && len(activeJobs) == 0 && len(successfulJobs) == 0 {
-			return TriggerReasonOneOff, 0
+			return triggerResult{reason: TriggerReasonOneOff}
 		}
-		return TriggerReasonNone, 0
+		return triggerResult{reason: TriggerReasonNone}
 	}
 
 	// Scheduled scan - check if it's time to run
-	reached, requeueAfter := r.isScheduledTimeReached(ctx, scan)
-	if reached {
-		return TriggerReasonSchedule, requeueAfter
+	schedInfo := r.isScheduledTimeReached(ctx, scan)
+	if schedInfo.reached {
+		return triggerResult{reason: TriggerReasonSchedule, schedule: schedInfo}
 	}
-	return TriggerReasonNone, requeueAfter
+	return triggerResult{reason: TriggerReasonNone, schedule: schedInfo}
+}
+
+// scheduleInfo contains the result of schedule evaluation.
+type scheduleInfo struct {
+	// reached is true if it's time to run a job
+	reached bool
+	// nextScheduleTime is the next time a job should run
+	nextScheduleTime time.Time
+	// waitDuration is the time until nextScheduleTime
+	waitDuration time.Duration
 }
 
 // isScheduledTimeReached checks if the scheduled time has been reached.
@@ -588,19 +599,20 @@ func (r *ClusterScanReconciler) shouldCreateJob(
 //  3. Checks if current time >= next scheduled time
 //  4. Handles startingDeadlineSeconds (missed schedule detection)
 //
-// Returns:
+// Returns scheduleInfo containing:
 //   - reached: true if it's time to run
+//   - nextScheduleTime: the calculated next schedule time
 //   - waitDuration: time until next schedule if not reached
 func (r *ClusterScanReconciler) isScheduledTimeReached(
 	ctx context.Context,
 	scan *scanv1alpha1.ClusterScan,
-) (bool, time.Duration) {
+) scheduleInfo {
 	log := logf.FromContext(ctx)
 
 	sched, err := cron.ParseStandard(scan.Spec.Schedule)
 	if err != nil {
 		log.Error(err, "Invalid cron schedule", "schedule", scan.Spec.Schedule)
-		return false, 0
+		return scheduleInfo{}
 	}
 
 	now := r.Now()
@@ -626,34 +638,20 @@ func (r *ClusterScanReconciler) isScheduledTimeReached(
 	}
 
 	if now.After(nextSchedule) || now.Equal(nextSchedule) {
-		return true, 0
-	}
-
-	return false, time.Until(nextSchedule)
-}
-
-// getNextScheduleTime returns the next scheduled time
-func (r *ClusterScanReconciler) getNextScheduleTime(scan *scanv1alpha1.ClusterScan) (time.Time, error) {
-	return r.getNextScheduleTimeWithParsedCron(scan, nil)
-}
-
-// getNextScheduleTimeWithParsedCron returns the next scheduled time using an optional pre-parsed cron.
-// This avoids parsing the cron expression twice when called after shouldCreateJob.
-func (r *ClusterScanReconciler) getNextScheduleTimeWithParsedCron(scan *scanv1alpha1.ClusterScan, parsedCron cron.Schedule) (time.Time, error) {
-	var sched cron.Schedule
-	var err error
-
-	if parsedCron != nil {
-		sched = parsedCron
-	} else {
-		sched, err = cron.ParseStandard(scan.Spec.Schedule)
-		if err != nil {
-			return time.Time{}, err
+		// Time to run - calculate the NEXT schedule after this one for status
+		futureSchedule := sched.Next(now)
+		return scheduleInfo{
+			reached:          true,
+			nextScheduleTime: futureSchedule,
+			waitDuration:     futureSchedule.Sub(now), // Use mocked clock instead of time.Until
 		}
 	}
 
-	now := r.Now()
-	return sched.Next(now), nil
+	return scheduleInfo{
+		reached:          false,
+		nextScheduleTime: nextSchedule,
+		waitDuration:     nextSchedule.Sub(now), // Use mocked clock instead of time.Until
+	}
 }
 
 // constructJobForClusterScan creates a Kubernetes Job from the ClusterScan spec.
@@ -1127,13 +1125,6 @@ func sortJobsByStartTime(jobs []*batchv1.Job) {
 		}
 		return jobs[i].Status.StartTime.Before(jobs[j].Status.StartTime)
 	})
-}
-
-// getMostRecentJob returns the job with the latest start time from two pre-sorted slices.
-// This is O(1) since we only need to compare the last element of each slice.
-func getMostRecentJob(sortedA, sortedB []*batchv1.Job) *batchv1.Job {
-	job, _ := getMostRecentJobWithStatus(sortedA, sortedB)
-	return job
 }
 
 // getMostRecentJobWithStatus returns the job with the latest start time from two pre-sorted slices,

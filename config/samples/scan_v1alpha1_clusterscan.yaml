@@ -72,6 +72,8 @@ metadata:
   namespace: default
 spec:
   # No schedule = one-off job, runs immediately
+  retainLogs: true      # Capture scan output in status
+  logsMaxBytes: 10000   # Max 10KB of logs
   scanTemplate:
     image: bitnami/kubectl:latest
     command:
